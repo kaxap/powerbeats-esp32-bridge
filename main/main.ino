@@ -7,8 +7,12 @@
  * them as a client and re-publishes the same reading as an ordinary chest strap
  * under BRIDGE_NAME, so anything that understands a BLE HR strap can use it.
  *
- * Ported from https://github.com/HuskerMinion/hr-bridge (MIT), which does the
- * same job for a Pixel Watch -> treadmill.
+ * Ported from https://github.com/HuskerMinion/hr-bridge, which does the same
+ * job for a Pixel Watch -> treadmill.
+ *
+ * Copyright (c) 2026 kaxap
+ * Copyright (c) 2026 HuskerMinion
+ * MIT License -- see LICENSE.
  *
  * ---------------------------------------------------------------------------
  * SETUP: Arduino IDE -> Tools -> Manage Libraries -> install "NimBLE-Arduino"

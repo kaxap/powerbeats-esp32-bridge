@@ -153,3 +153,8 @@ These constants are at the top of `main/main.ino`.
 Based on [HuskerMinion/hr-bridge](https://github.com/HuskerMinion/hr-bridge)
 (MIT), which does the same job for a Pixel Watch and a treadmill. Its README
 has more design notes.
+
+## License
+
+[MIT](LICENSE). The original hr-bridge copyright notice is kept alongside this
+project's.
