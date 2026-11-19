@@ -25,6 +25,7 @@
  *   s = rescan for the earbuds    d = drop the earbuds link
  *   p = pause/resume scanning     a = stop and restart advertising
  *   v = verbose logging on/off    i = print status now      r = reboot
+ *   b = read battery now          g = list the earbuds' GATT services
  */
 
 #include <NimBLEDevice.h>
@@ -41,13 +42,32 @@ static_assert(sizeof(BRIDGE_NAME) - 1 <= 22, "BRIDGE_NAME must be 22 characters 
 // rotating private address, so it can't be remembered either.
 static const char*    SOURCE_NAME_PREFIX   = "Powerbeats";
 
+// Battery level. The earbuds' heart-rate link has no Battery Service, but like
+// AirPods they broadcast Apple "proximity pairing" adverts that carry each bud's
+// charge in 10% steps. While bridging, the bridge scans for those for a few
+// seconds once a minute and publishes the lower of the two buds as a standard
+// Battery Service (0x180F). The adverts come from a different, rotating address
+// than "Powerbeats HR", so they're matched by Apple model ID and the strongest
+// signal wins. 0x201D = Powerbeats Pro 2 (observed). 0 = accept any AirPods or
+// Beats model; with `v` on, every such advert is logged with its model ID.
+static const bool     RELAY_BATTERY          = true;
+static const uint16_t SOURCE_APPLE_MODEL     = 0x201D;
+static const uint32_t BATTERY_SCAN_EVERY_MS  = 60000;
+static const uint32_t BATTERY_RETRY_MS       = 15000;  // until the first reading
+static const uint32_t BATTERY_SCAN_LEN_MS    = 5000;
+
 // If the earbuds refuse to let us subscribe without encryption, pair with them
 // (Just Works, no PIN) and retry once. The receiver side never needs pairing.
 static const bool     SOURCE_ALLOW_PAIRING = true;
 
 static const bool     USE_EXTERNAL_ANTENNA = false;  // true = u.FL connector
 
-static const uint32_t NOTIFY_INTERVAL_MS   = 1000;   // receivers expect ~1 Hz
+// Every reading from the earbuds is forwarded the moment it arrives. This timer
+// only re-sends the last value when nothing new has come in for a while, so a
+// receiver keeps hearing from us (with the contact bit cleared once stale). It
+// is a bit longer than the earbuds' ~1 s cadence so it doesn't fire between two
+// on-time readings and send a duplicate.
+static const uint32_t KEEPALIVE_MS         = 1200;
 
 // How long a reading stays trustworthy. Past this we keep notifying but clear
 // the sensor-contact bit -- see pushHR() for why that matters.
@@ -75,6 +95,13 @@ static const uint16_t CONN_MAX_INTERVAL    = 40;     // 50 ms
 static const uint16_t CONN_LATENCY         = 0;
 static const uint16_t CONN_TIMEOUT         = 600;    // 6000 ms
 
+// Right after connecting, the earbuds ask for a ~500 ms connection interval. A
+// reading can only cross at a connection event, so accepting that adds ~250 ms
+// on average. With this on, the bridge refuses any request slower than
+// CONN_MAX_INTERVAL and the link stays at 30-50 ms. It may cost the earbuds
+// some battery. Set false to accept whatever they ask for.
+static const bool     KEEP_FAST_SOURCE_INTERVAL = true;
+
 static bool verbose = false;             // 'v' toggles at runtime
 
 // ---------------------------- STATUS LED -----------------------------------
@@ -96,6 +123,8 @@ static const uint32_t ADV_DOWN_ERROR_MS     = 5000;
 static const NimBLEUUID SVC_HEART_RATE((uint16_t)0x180D);
 static const NimBLEUUID CHR_HR_MEASUREMENT((uint16_t)0x2A37);
 static const NimBLEUUID CHR_BODY_SENSOR_LOC((uint16_t)0x2A38);
+static const NimBLEUUID SVC_BATTERY((uint16_t)0x180F);
+static const NimBLEUUID CHR_BATTERY_LEVEL((uint16_t)0x2A19);
 
 static NimBLEServer*           pServer       = nullptr;
 static NimBLECharacteristic*   pHRChar       = nullptr;
@@ -117,6 +146,24 @@ static volatile uint16_t lastHR   = 0;
 static volatile uint32_t lastHRms = 0;
 
 static uint32_t lastNotifyMs  = 0;
+
+// Low-latency hand-off from the BLE callback to loop(). The callback stores the
+// reading, sets hrPending and wakes the loop task, which forwards it at once.
+static TaskHandle_t      loopTaskHandle = nullptr;
+static volatile bool     hrPending      = false;
+static volatile uint32_t hrRxUs         = 0;      // micros() when it arrived
+static uint32_t          relayLastUs    = 0;      // arrival -> forwarded
+static uint32_t          relayMaxUs     = 0;
+static uint16_t          receiverHandle = 0xFFFF;
+
+// Battery, filled from Apple proximity adverts (see RELAY_BATTERY).
+static NimBLECharacteristic* pBattChar      = nullptr;
+static bool              batteryScanning = false;  // current scan is a short battery scan
+static uint32_t          lastBattScanMs  = 0;
+static int               battPct         = -1;     // what we publish, -1 = unknown
+static volatile bool     battFresh       = false;  // new candidate from the scan callback
+static volatile int      battBestRssi    = -128;   // strongest advert this scan
+static volatile uint8_t  battPodA = 0xF, battPodB = 0xF, battCase = 0xF, battFlags = 0;
 static uint32_t lastScanMs    = 0;
 static uint32_t lastBeatMs    = 0;
 static uint32_t linkedSinceMs = 0;
@@ -140,14 +187,28 @@ static bool hrFresh() {
 static void printStatus(const char* tag) {
   uint32_t now = millis();
   uint32_t t   = lastHRms;
-  Serial.printf("[%6lus] %-9s earbuds=%d receiver=%d adv=%d scan=%d hr=%u age=%lds free=%lu\n",
+  Serial.printf("[%6lus] %-9s earbuds=%d receiver=%d adv=%d scan=%d hr=%u age=%lds batt=%d%% free=%lu\n",
                 (unsigned long)(now / 1000), tag,
                 sourceLinked() ? 1 : 0, receiverConnected ? 1 : 0,
                 advertisingNow() ? 1 : 0, scanning ? 1 : 0,
                 (unsigned)lastHR,
                 t ? (long)((now - t) / 1000) : -1L,
+                battPct,
                 (unsigned long)ESP.getFreeHeap());
   lastBeatMs = now;
+}
+
+// Connection intervals on both links plus how long a reading sits in the
+// bridge before it's forwarded -- the parts of the latency we can see.
+static void printTiming() {
+  float srcIvl = sourceLinked() ? pClient->getConnInfo().getConnInterval() * 1.25f : 0.0f;
+  float rcvIvl = 0.0f;
+  if (receiverConnected && receiverHandle != 0xFFFF && pServer != nullptr) {
+    rcvIvl = pServer->getPeerInfoByHandle(receiverHandle).getConnInterval() * 1.25f;
+  }
+  Serial.printf("          timing    earbuds-interval=%.2fms receiver-interval=%.2fms "
+                "relay-last=%.2fms relay-max=%.2fms\n",
+                srcIvl, rcvIvl, relayLastUs / 1000.0f, relayMaxUs / 1000.0f);
 }
 
 // Print only when something actually changed, so a quiet system stays quiet.
@@ -279,8 +340,14 @@ static void onSourceHR(NimBLERemoteCharacteristic* pChr, uint8_t* pData, size_t 
   if (hr == 0) return;                   // a 0 is "no reading", not a heart rate
 
   bool firstOfSession = (lastHRms == 0);
-  lastHR   = hr;
-  lastHRms = millis();
+  lastHR    = hr;
+  lastHRms  = millis();
+  hrRxUs    = micros();
+  hrPending = true;
+  // Wake loop() now instead of letting it finish its 20 ms nap. The actual
+  // notify happens there -- no BLE calls from inside BLE callbacks.
+  if (loopTaskHandle != nullptr) xTaskNotifyGive(loopTaskHandle);
+
   if (firstOfSession) Serial.printf("Heart rate flowing: %u bpm\n", (unsigned)hr);
   if (verbose) Serial.printf("  hr %u (flags 0x%02X, %u bytes)\n", (unsigned)hr, pData[0], (unsigned)length);
 }
@@ -289,10 +356,18 @@ static void onSourceHR(NimBLERemoteCharacteristic* pChr, uint8_t* pData, size_t 
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
     receiverConnected = true;
-    Serial.printf(">>> RECEIVER CONNECTED (%s)\n", connInfo.getAddress().toString().c_str());
+    receiverHandle    = connInfo.getConnHandle();
+    Serial.printf(">>> RECEIVER CONNECTED (%s, interval %.2f ms)\n",
+                  connInfo.getAddress().toString().c_str(),
+                  connInfo.getConnInterval() * 1.25f);
+  }
+  void onConnParamsUpdate(NimBLEConnInfo& connInfo) override {
+    Serial.printf("Receiver connection interval now %.2f ms\n",
+                  connInfo.getConnInterval() * 1.25f);
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int reason) override {
     receiverConnected = false;
+    receiverHandle    = 0xFFFF;
     wantAdvertise     = true;            // restarted from loop(), never from here
     // 0x213 = remote user terminated (the receiver chose to hang up)
     // 0x208 = supervision timeout (the link was starved)
@@ -313,10 +388,52 @@ class ClientCallbacks : public NimBLEClientCallbacks {
                   connInfo.isEncrypted() ? "ok" : "FAILED",
                   connInfo.isEncrypted() ? 1 : 0, connInfo.isBonded() ? 1 : 0);
   }
+  bool onConnParamsUpdateRequest(NimBLEClient* c, const ble_gap_upd_params* p) override {
+    // Their interval is part of the end-to-end latency -- see
+    // KEEP_FAST_SOURCE_INTERVAL. Always logged.
+    bool accept = !KEEP_FAST_SOURCE_INTERVAL || p->itvl_min <= CONN_MAX_INTERVAL;
+    Serial.printf("Earbuds asked for interval %.2f-%.2f ms (latency %u): %s\n",
+                  p->itvl_min * 1.25f, p->itvl_max * 1.25f, (unsigned)p->latency,
+                  accept ? "accepted" : "refused, keeping the fast interval");
+    return accept;
+  }
 };
+
+// Apple "proximity pairing" advert (manufacturer data, company 0x004C, type 0x07):
+//   [0-1] 4C 00  [2] 07  [3] length  [4] prefix  [5-6] model (LE)  [7] status
+//   [8] pod batteries, one per nibble  [9] charging flags (hi) | case battery (lo)
+// Battery nibbles are 0-10 (x10%), 0xF = unknown / not connected.
+static void parseAppleProximity(const NimBLEAdvertisedDevice* dev) {
+  for (uint8_t i = 0; i < dev->getManufacturerDataCount(); i++) {
+    std::string md = dev->getManufacturerData(i);
+    if (md.size() < 10) continue;
+    const uint8_t* d = (const uint8_t*)md.data();
+    if (d[0] != 0x4C || d[1] != 0x00 || d[2] != 0x07) continue;
+
+    uint16_t model = (uint16_t)d[5] | ((uint16_t)d[6] << 8);
+    int      rssi  = dev->getRSSI();
+    if (verbose) {
+      Serial.printf("  apple-07 model=0x%04X rssi=%d pods=%X/%X case=%X flags=%X raw=",
+                    model, rssi, d[8] >> 4, d[8] & 0x0F, d[9] & 0x0F, d[9] >> 4);
+      for (size_t k = 0; k < md.size(); k++) Serial.printf("%02X", d[k]);
+      Serial.println();
+    }
+    if (SOURCE_APPLE_MODEL != 0 && model != SOURCE_APPLE_MODEL) continue;
+    if (rssi <= battBestRssi) continue;  // someone else's, further away
+
+    battBestRssi = rssi;
+    battPodA     = d[8] >> 4;
+    battPodB     = d[8] & 0x0F;
+    battCase     = d[9] & 0x0F;
+    battFlags    = d[9] >> 4;
+    battFresh    = true;
+  }
+}
 
 class ScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* dev) override {
+    if (RELAY_BATTERY) parseAppleProximity(dev);
+
     if (verbose && dev->haveName()) {
       Serial.printf("  seen \"%s\" %s rssi=%d%s\n",
                     dev->getName().c_str(), dev->getAddress().toString().c_str(),
@@ -334,7 +451,8 @@ class ScanCallbacks : public NimBLEScanCallbacks {
     wantConnect = true;
   }
   void onScanEnd(const NimBLEScanResults& results, int reason) override {
-    scanning = false;                    // the watchdog in loop() restarts it
+    scanning        = false;             // the watchdog in loop() restarts it
+    batteryScanning = false;
   }
 };
 
@@ -343,17 +461,42 @@ static ClientCallbacks clientCallbacks;
 static ScanCallbacks   scanCallbacks;
 
 // ------------------------------ scanning ---------------------------------
-static void startScan() {
+// durationMs = 0 scans until stopped (looking for the earbuds); anything else
+// is a short battery scan while already linked.
+static void startScan(uint32_t durationMs = 0) {
   NimBLEScan* pScan = NimBLEDevice::getScan();
   pScan->stop();
   pScan->clearResults();                 // NimBLE filters duplicates against this
-  scanning   = pScan->start(0, false, true);   // 0 = forever, restart clears the cache
+  battBestRssi    = -128;                // pick the strongest advert per scan
+  batteryScanning = (durationMs != 0);
+  scanning   = pScan->start(durationMs, false, true);   // restart clears the cache
   lastScanMs = millis();
   if (!scanning) {
+    batteryScanning = false;
     Serial.println("Scan failed to start, will retry.");
-    sourceErrorMs = millis();
+    if (durationMs == 0) sourceErrorMs = millis();
   } else if (verbose) {
-    Serial.println("  scanning");
+    Serial.println(durationMs ? "  battery scan" : "  scanning");
+  }
+}
+
+// Turn the latest advert into one percentage and publish it if it changed.
+static int podPct(uint8_t n) { return n <= 10 ? n * 10 : -1; }
+
+static void commitBattery() {
+  if (!battFresh) return;
+  battFresh = false;
+  int a = podPct(battPodA), b = podPct(battPodB);
+  int pct = (a >= 0 && b >= 0) ? (a < b ? a : b) : (a >= 0 ? a : b);
+  if (pct < 0 || pct == battPct) return;
+
+  battPct = pct;
+  Serial.printf("Earbuds battery %d%% (buds %d/%d%%, case %d%%)\n",
+                pct, a, b, podPct(battCase));
+  if (pBattChar != nullptr) {
+    uint8_t v = (uint8_t)pct;
+    pBattChar->setValue(&v, 1);
+    if (receiverConnected) pBattChar->notify();
   }
 }
 
@@ -391,6 +534,12 @@ static void connectToSource() {
     return;
   }
 
+  // Discover the whole GATT table up front, before subscribing. Rediscovering
+  // later would delete the characteristic objects our notify callback hangs on.
+  if (!pClient->discoverAttributes()) {
+    Serial.println("Full service discovery failed, looking up heart rate only.");
+  }
+
   NimBLERemoteService* svc = pClient->getService(SVC_HEART_RATE);
   NimBLERemoteCharacteristic* chr =
       svc ? svc->getCharacteristic(CHR_HR_MEASUREMENT) : nullptr;
@@ -425,7 +574,24 @@ static void connectToSource() {
   // getting the first-reading grace period. lastHR is left alone on purpose.
   lastHRms      = 0;
   linkedSinceMs = millis();
-  Serial.println("Earbuds connected, waiting for first reading...");
+  Serial.printf("Earbuds connected (interval %.2f ms), waiting for first reading...\n",
+                pClient->getConnInfo().getConnInterval() * 1.25f);
+}
+
+// Print the earbuds' services and characteristics as discovered at connect.
+// Uses the cached table only -- a refresh would break the HR subscription.
+static void dumpSourceGatt() {
+  if (!sourceLinked()) { Serial.println("[cmd] earbuds not connected"); return; }
+  Serial.println("[cmd] earbuds GATT table (R=read W=write w=write-no-rsp N=notify I=indicate):");
+  for (NimBLERemoteService* s : pClient->getServices(false)) {
+    Serial.printf("  service %s\n", s->getUUID().toString().c_str());
+    for (NimBLERemoteCharacteristic* c : s->getCharacteristics(false)) {
+      Serial.printf("    char %-38s %c%c%c%c%c\n", c->getUUID().toString().c_str(),
+                    c->canRead() ? 'R' : '-', c->canWrite() ? 'W' : '-',
+                    c->canWriteNoResponse() ? 'w' : '-', c->canNotify() ? 'N' : '-',
+                    c->canIndicate() ? 'I' : '-');
+    }
+  }
 }
 
 // --------------------------- serial commands -----------------------------
@@ -447,7 +613,12 @@ static void handleSerial() {
         break;
       case 'd': dropSource("manual"); break;
       case 'v': verbose = !verbose; Serial.printf("[cmd] verbose %s\n", verbose ? "ON" : "OFF"); break;
-      case 'i': printStatus("info"); break;
+      case 'i': printStatus("info"); printTiming(); break;
+      case 'g': dumpSourceGatt(); break;
+      case 'b':
+        lastBattScanMs = 0;              // loop() starts one as soon as it can
+        Serial.printf("[cmd] battery scan requested (last %d%%)\n", battPct);
+        break;
       case 'r': Serial.println("[cmd] reboot"); delay(100); ESP.restart(); break;
       default: break;
     }
@@ -456,11 +627,13 @@ static void handleSerial() {
 
 // -------------------------------- setup ----------------------------------
 void setup() {
+  loopTaskHandle = xTaskGetCurrentTaskHandle();   // setup() and loop() share a task
+
   Serial.begin(115200);
   delay(300);
 
   Serial.printf("\n=== Powerbeats -> %s HR bridge ===\n", BRIDGE_NAME);
-  Serial.println("s=rescan p=pause a=re-advertise d=drop v=verbose i=info r=reboot");
+  Serial.println("s=rescan p=pause a=re-advertise d=drop v=verbose i=info b=battery g=gatt r=reboot");
 
   // The XIAO_ESP32C6 variant already enables the RF switch (GPIO3 LOW) and
   // selects the onboard antenna (GPIO14 LOW) before setup() runs. Only touch
@@ -505,6 +678,14 @@ void setup() {
   // lobe would be the honest answer, if a receiver ever cares.)
   uint8_t sensorLocation = 1;
   pLocChar->setValue(&sensorLocation, 1);
+
+  if (RELAY_BATTERY) {
+    // Standard Battery Service. Left empty until the first reading arrives
+    // rather than reporting a made-up number.
+    NimBLEService* pBattService = pServer->createService(SVC_BATTERY);
+    pBattChar = pBattService->createCharacteristic(
+                  CHR_BATTERY_LEVEL, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  }
 
   if (!pServer->start()) {               // NimBLE 2.x starts all services here
     Serial.println("FATAL: GATT server failed to start.");
@@ -590,7 +771,15 @@ void loop() {
   }
 
   if (sourceLinked()) {
-    if (scanning) { NimBLEDevice::getScan()->stop(); scanning = false; }
+    // The open-ended search scan isn't needed once linked. Short battery scans
+    // are, every BATTERY_SCAN_EVERY_MS (sooner until the first reading).
+    if (scanning && !batteryScanning) { NimBLEDevice::getScan()->stop(); scanning = false; }
+    if (RELAY_BATTERY && !scanning &&
+        (lastBattScanMs == 0 ||
+         now - lastBattScanMs >= (battPct < 0 ? BATTERY_RETRY_MS : BATTERY_SCAN_EVERY_MS))) {
+      lastBattScanMs = now;
+      startScan(BATTERY_SCAN_LEN_MS);
+    }
 
     uint32_t t = lastHRms;
     bool silent;
@@ -605,14 +794,34 @@ void loop() {
     if (scanEnabled && !scanning && (now - lastScanMs >= SCAN_RETRY_MS)) startScan();
   }
 
-  if (now - lastNotifyMs >= NOTIFY_INTERVAL_MS) {
+  commitBattery();
+
+  if (hrPending) {
+    // A fresh reading: forward it right away.
+    hrPending = false;
+    uint32_t rx = hrRxUs;
+    pushHR();
+    relayLastUs = micros() - rx;
+    if (relayLastUs > relayMaxUs) relayMaxUs = relayLastUs;
+    lastNotifyMs = millis();
+    if (verbose) {
+      Serial.printf("  relayed %u bpm %.2f ms after arrival%s\n", (unsigned)lastHR,
+                    relayLastUs / 1000.0f, receiverConnected ? "" : " (no receiver)");
+    }
+  } else if (now - lastNotifyMs >= KEEPALIVE_MS) {
+    // Nothing new for a while: repeat the last value so the receiver stays
+    // happy. pushHR() clears the contact bit once the reading is stale.
     lastNotifyMs = now;
     pushHR();
   }
 
   updateLed();
   statusIfChanged();
-  if (now - lastBeatMs >= HEARTBEAT_MS) printStatus("status");
+  // millis(), not `now`: statusIfChanged() may have just stamped lastBeatMs
+  // with a later time, and `now - lastBeatMs` would underflow.
+  if (millis() - lastBeatMs >= HEARTBEAT_MS) printStatus("status");
 
-  delay(20);
+  // Sleep up to 20 ms (keeps the LED patterns smooth), but wake immediately
+  // when onSourceHR() signals a new reading.
+  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
 }
